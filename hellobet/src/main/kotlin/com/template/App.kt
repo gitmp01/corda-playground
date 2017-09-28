@@ -39,7 +39,7 @@ class TemplateApi(val services: CordaRPCOps) {
 // *****************
 // * Contract Code *
 // *****************
-open class TemplateContract : Contract {
+/* open class TemplateContract : Contract {
     // The verify() function of the contract for each of the transaction's input and output states must not throw an
     // exception for a transaction to be considered valid.
     override fun verify(tx: LedgerTransaction) {
@@ -48,33 +48,125 @@ open class TemplateContract : Contract {
 
     // A reference to the underlying legal contract template and associated parameters.
     override val legalContractReference: SecureHash = SecureHash.zeroHash
+}*/
+
+
+
+class BetContract : Contract {
+    
+    interface Commands : CommandData {
+        class Create : TypeOnlyCommandData(), Commands
+    }
+
+    
+    override fun verify(tx: LedgerTransaction) {
+         
+         val command = tx.commands.requireSingleCommand<Commands.Create>()
+
+         requireThat {
+            "No inputs should be consumed when issuing an IOU." using (tx.inputs.isEmpty())
+            "Only one output state should be created." using (tx.outputs.size == 1)
+            val out = tx.outputsOfType<Bet>().single()
+            "PartyA and PartyB must be different" using (out.partyA != out.partyB)
+            "The bet ammount must be non-negative." using (out.iou.ammount > 0)
+         }
+    }
+
+    override val legalContractReference: SecureHash = SecureHash.sha256("You bet")
 }
 
 // *********
 // * State *
 // *********
-class TemplateState(val data: String) : ContractState {
+/*class TemplateState(val data: String) : ContractState {
     override val participants: List<AbstractParty> get() = listOf()
     override val contract: TemplateContract get() = TemplateContract()
+}*/
+
+data class Bet(val partyA: Party, val partyB: Party, val ammount: Int, override val linearId: UniqueIdentifier = UniqueIdentifier()) : LinearState {
+
+    // Contract state overriding
+    override val participants: List<AbstractParty> get() = listOf(partyA, partyB)
+    override val contract: BetContract get() = BetContract() // TODO
+
+    // Overriding needed? let's see
+    override fun withNewOwner(newOwner: AbstractParty) = CommandAndState(Commands.Move(), copy(owner = newOwner))
+    override fun toString() = "${Emoji.unicorn} $partyA and $partyB are betting hard: $ammount"
+
+    // Tells the vault to track a state if we are one of the parties involved. 
+    override fun isRelevant(ourKeys: Set<PublicKey>) = ourKeys.intersect(participants.flatMap { it.owningKey.keys }).isNotEmpty()
 }
+
 
 // *********
 // * Flows *
 // *********
 @InitiatingFlow
 @StartableByRPC
-class Initiator : FlowLogic<Unit>() {
+class BettingProcess(val otherParty, val valueToBet: Int) : FlowLogic<SignedTransaction>() {
+
+    companion object {
+        object GENERATING_TRANSACTION : Step("Generating transaction based on new IOU.")
+        object VERIFYING_TRANSACTION : Step("Verifying contract constraints.")
+        object SIGNING_TRANSACTION : Step("Signing transaction with our private key.")
+        object GATHERING_SIGS : Step("Gathering the counterparty's signature.") {
+            override fun childProgressTracker() = CollectSignaturesFlow.tracker()
+        }
+
+        object FINALISING_TRANSACTION : Step("Obtaining notary signature and recording transaction.") {
+            override fun childProgressTracker() = FinalityFlow.tracker()
+        }
+
+        fun tracker() = ProgressTracker(
+                GENERATING_TRANSACTION,
+                VERIFYING_TRANSACTION,
+                SIGNING_TRANSACTION,
+                GATHERING_SIGS,
+                FINALISING_TRANSACTION
+        )
+    }
+
+    override val progressTracker
+
     @Suspendable
     override fun call() {
-        return Unit
+        // Obtain a reference to the notary we want to use.
+        val notary = serviceHub.networkMapCache.notaryNodes.single().notaryIdentity
+
+        progressTracker.currentStep = GENERATING_TRANSACTION
+        val betState = Bet(serviceHub.myInfo.legalIdentity, otherParty, valueToBet)
+        val cmd = Command(BetContract.Commands.Create(), betState.participants.map{ it.owningKey })
+        val txBuilder = TransactionBuilder(TransactionType.General, notary).withItems(betState, cmd)
+
+        progressTracker.currentStep = VERIFYING_TRANSACTION
+
+        // WireTransaction = transaction without any signature attached
+        txBuilder.toWireTransaction().toLedgerTransaction(serviceHub).verify()
+
+        progressTracker.currentStep = SIGNING_TRANSACTION
+
+        val partSignedTx = serviceHub.signInitialTransaction(txBuilder)
+
+        progressTracker.currentStep = GATHERING_SIGS
+
+        val fullySignedTx = subFlow(CollectSignaturesFlow(partSignedTx, GATHERING_SIGS.childProgressTracker()))
+
+        progressTracker.currentStep = FINALISING_TRANSACTION
+
+        return subFlow(FinalityFlow(fullySignedTx, FINALISING_TRANSACTION.childProgressTracker())).single()
     }
 }
 
 @InitiatedBy(Initiator::class)
-class Responder(val otherParty: Party) : FlowLogic<Unit>() {
+class Responder(val otherParty: Party) : FlowLogic<SignedTransaction>() {
     @Suspendable
-    override fun call() {
-        return Unit
+    override fun call() : SignedTransaction {
+        val signTransactionFlow = object : SignTransactionFlow(otherParty) {
+            override fun checkTransaction(stx: SignedTransaction) = requireThat {
+                val output = stx.tx.outputs.single().data
+                "This must be an IOU transaction"
+            }
+        }
     }
 }
 
